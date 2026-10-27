@@ -1,0 +1,488 @@
+"""
+SMS Monitor: ClickHouse -> поиск признаков -> Word-отчёты.
+
+Перед запуском:
+    pip install clickhouse-connect python-docx
+
+Рядом с этим файлом нужен keywords.txt: один признак на строку.
+Остальные файлы и папки программа создаст сама.
+"""
+
+import hashlib
+import logging
+import os
+import re
+import time
+from datetime import date, datetime, time as clock_time, timedelta
+from pathlib import Path
+
+import clickhouse_connect
+from docx import Document
+from docx.enum.section import WD_ORIENT
+from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.shared import Cm, Pt
+
+
+# =====================================================================
+# ЗАПОЛНИ ТОЛЬКО ЭТОТ БЛОК
+# =====================================================================
+
+CLICKHOUSE_HOST = ""       
+CLICKHOUSE_PORT = 8123              
+CLICKHOUSE_USER = ""
+CLICKHOUSE_PASSWORD = ""
+CLICKHOUSE_DATABASE = ""
+CLICKHOUSE_TABLE = ""
+CLICKHOUSE_SECURE = False           
+CLICKHOUSE_VERIFY_TLS = True
+
+# Имена колонок из таблицы.
+DATETIME_COLUMN = "DateTime"
+TEXT_COLUMN = "TpData"
+PHONE_TO_COLUMN = "PhoneTo"
+PHONE_FROM_COLUMN = "PhoneFrom"
+
+# Первый момент, с которого нужно забирать SMS.
+FIRST_START = datetime(2026, 10, 27, 7, 0, 0)
+
+# В 06:45 закрывается предыдущий отчёт и начинается следующий.
+REPORT_BOUNDARY = clock_time(6, 45)
+
+# Моменты ежедневных запросов.
+# 06:45 закрывает старый файл; 07:00 забирает 15 минут в новый.
+RUN_TIMES = [
+    clock_time(3, 0),
+    clock_time(6, 45),
+    clock_time(7, 0),
+    clock_time(11, 0),
+    clock_time(15, 0),
+    clock_time(19, 0),
+    clock_time(23, 0),
+]
+
+# Каждый раз повторно проверяем последние 24 часа.
+# Это помогает подобрать SMS, которое попало в ClickHouse с задержкой.
+# hashes.txt убирает повторы, поэтому повторная выборка безопасна.
+OVERLAP_MINUTES = 24 * 60
+RETRY_MINUTES = 5
+
+
+BASE_DIR = Path(__file__).resolve().parent
+KEYWORDS_FILE = BASE_DIR / "keywords.txt"
+HASHES_FILE = BASE_DIR / "hashes.txt"
+CURSOR_FILE = BASE_DIR / "last_query.txt"
+LOG_FILE = BASE_DIR / "sms_monitor.log"
+REPORTS_DIR = BASE_DIR / "reports"
+IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def setup_logging():
+    """Пишет события одновременно на экран и в sms_monitor.log."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        handlers=[
+            logging.FileHandler(LOG_FILE, encoding="utf-8"),
+            logging.StreamHandler(),
+        ],
+    )
+
+
+def validate_identifier(value, description):
+    """Не позволяет случайно вставить в имя таблицы SQL-код."""
+    if not IDENTIFIER_RE.fullmatch(value):
+        raise ValueError(f"Неверное {description}: {value!r}")
+    return f"`{value}`"
+
+
+def load_keywords():
+    """Читает непустые строки из keywords.txt."""
+    if not KEYWORDS_FILE.exists():
+        raise FileNotFoundError(
+            f"Создайте {KEYWORDS_FILE} и запишите в него признаки по одному на строку."
+        )
+    with KEYWORDS_FILE.open("r", encoding="utf-8-sig") as file:
+        keywords = [
+            line.strip()
+            for line in file
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+    if not keywords:
+        raise ValueError("keywords.txt пуст")
+    return keywords
+
+
+def load_hashes():
+    """Возвращает множество хэшей. Если файла нет, возвращает пустое."""
+    if not HASHES_FILE.exists():
+        return set()
+    with HASHES_FILE.open("r", encoding="ascii", errors="ignore") as file:
+        return {line.strip() for line in file if line.strip()}
+
+
+def append_hashes(values):
+    """Дописывает новые хэши в hashes.txt и сразу сбрасывает их на диск."""
+    if not values:
+        return
+    with HASHES_FILE.open("a", encoding="ascii", newline="\n") as file:
+        for value in sorted(values):
+            file.write(value + "\n")
+        file.flush()
+        os.fsync(file.fileno())
+
+
+def make_hash(text):
+    """Считает SHA-256 только из полного текста TpData."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def find_first_keyword(text, keywords):
+    """Ищет первое целое слово без учёта регистра."""
+    for keyword in keywords:
+        pattern = rf"(?<!\w){re.escape(keyword)}(?!\w)"
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            return keyword
+    return None
+
+
+def load_cursor():
+    """Читает время последнего успешного запроса."""
+    if not CURSOR_FILE.exists():
+        return FIRST_START
+    try:
+        value = datetime.fromisoformat(CURSOR_FILE.read_text(encoding="ascii").strip())
+    except (OSError, ValueError):
+        logging.warning("Не удалось прочитать last_query.txt; начинаю с FIRST_START")
+        return FIRST_START
+    return max(FIRST_START, value - timedelta(minutes=OVERLAP_MINUTES))
+
+
+def save_cursor(value):
+    """Атомарно сохраняет время успешного запроса."""
+    temporary = CURSOR_FILE.with_suffix(".tmp")
+    temporary.write_text(value.isoformat(timespec="seconds"), encoding="ascii")
+    temporary.replace(CURSOR_FILE)
+
+
+def get_client():
+    """Создаёт подключение к ClickHouse."""
+    return clickhouse_connect.get_client(
+        host=CLICKHOUSE_HOST,
+        port=CLICKHOUSE_PORT,
+        username=CLICKHOUSE_USER,
+        password=CLICKHOUSE_PASSWORD,
+        database=CLICKHOUSE_DATABASE,
+        secure=CLICKHOUSE_SECURE,
+        verify=CLICKHOUSE_VERIFY_TLS,
+        connect_timeout=15,
+        send_receive_timeout=120,
+    )
+
+
+def read_messages(client, start, end, keywords):
+    """Запрашивает SMS за полуоткрытый интервал [start, end)."""
+    database = validate_identifier(CLICKHOUSE_DATABASE, "имя базы")
+    table = validate_identifier(CLICKHOUSE_TABLE, "имя таблицы")
+    dt_column = validate_identifier(DATETIME_COLUMN, "DateTime-колонка")
+    text_column = validate_identifier(TEXT_COLUMN, "TpData-колонка")
+    to_column = validate_identifier(PHONE_TO_COLUMN, "PhoneTo-колонка")
+    from_column = validate_identifier(PHONE_FROM_COLUMN, "PhoneFrom-колонка")
+
+    # Предварительный поиск в ClickHouse уменьшает объём передаваемых данных.
+    # Точные границы слова затем всё равно проверяет Python.
+    keyword_conditions = []
+    parameters = {"start": start, "end": end}
+    for number, keyword in enumerate(keywords):
+        parameter_name = f"keyword_{number}"
+        keyword_conditions.append(
+            f"positionCaseInsensitiveUTF8(toString({text_column}), "
+            f"{{{parameter_name}:String}}) > 0"
+        )
+        parameters[parameter_name] = keyword
+
+    query = f"""
+        SELECT
+            toString({dt_column}) AS DateTime,
+            toString({from_column}) AS PhoneFrom,
+            toString({to_column}) AS PhoneTo,
+            toString({text_column}) AS TpData
+        FROM {database}.{table}
+        WHERE {dt_column} >= {{start:DateTime}}
+          AND {dt_column} < {{end:DateTime}}
+          AND ({' OR '.join(keyword_conditions)})
+        ORDER BY {dt_column}
+    """
+
+    result = client.query(query, parameters=parameters)
+    return list(result.named_results())
+
+
+def parse_datetime(value):
+    """Превращает DateTime из ClickHouse в datetime Python."""
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    result = datetime.fromisoformat(text)
+    return result.replace(tzinfo=None)
+
+
+def report_date_for(message_datetime):
+    """
+    06:44:59 относится к предыдущему дню.
+    06:45:00 и позже относится уже к новому дню.
+    """
+    if message_datetime.time() >= REPORT_BOUNDARY:
+        return message_datetime.date()
+    return message_datetime.date() - timedelta(days=1)
+
+
+def normalize_message(row, keywords):
+    """Проверяет одну строку и готовит её для отчёта."""
+    text = "" if row.get("TpData") is None else str(row.get("TpData"))
+    if not text:
+        return None
+    keyword = find_first_keyword(text, keywords)
+    if keyword is None:
+        return None
+    message_datetime = parse_datetime(row.get("DateTime"))
+    return {
+        "hash": make_hash(text),
+        "keyword": keyword,
+        "PhoneFrom": "" if row.get("PhoneFrom") is None else str(row.get("PhoneFrom")),
+        "PhoneTo": "" if row.get("PhoneTo") is None else str(row.get("PhoneTo")),
+        "DateTime": message_datetime.strftime("%Y-%m-%d %H:%M:%S"),
+        "TpData": text,
+        "report_date": report_date_for(message_datetime),
+    }
+
+
+def set_cell_text(cell, text, bold=False, size=9):
+    """Записывает текст в ячейку Word-таблицы."""
+    cell.text = ""
+    paragraph = cell.paragraphs[0]
+    paragraph.paragraph_format.space_after = Pt(0)
+    run = paragraph.add_run(str(text))
+    run.bold = bold
+    run.font.name = "Arial"
+    run.font.size = Pt(size)
+    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+
+
+def shade_cell(cell, color):
+    """Задаёт фон ячейки."""
+    properties = cell._tc.get_or_add_tcPr()
+    shading = properties.find(qn("w:shd"))
+    if shading is None:
+        shading = OxmlElement("w:shd")
+        properties.append(shading)
+    shading.set(qn("w:fill"), color)
+
+
+def set_repeat_table_header(row):
+    """Повторяет заголовок таблицы на новой странице."""
+    row_properties = row._tr.get_or_add_trPr()
+    table_header = OxmlElement("w:tblHeader")
+    table_header.set(qn("w:val"), "true")
+    row_properties.append(table_header)
+
+
+def read_existing_records(report_path):
+    """Читает уже записанные SMS из Word-таблицы."""
+    if not report_path.exists():
+        return []
+    document = Document(report_path)
+    if not document.tables:
+        return []
+    records = []
+    for row in document.tables[0].rows[1:]:
+        values = [cell.text for cell in row.cells]
+        if len(values) < 5:
+            continue
+        keyword, phone_from, phone_to, date_time, text = values[:5]
+        records.append(
+            {
+                "hash": make_hash(text),
+                "keyword": keyword,
+                "PhoneFrom": phone_from,
+                "PhoneTo": phone_to,
+                "DateTime": date_time,
+                "TpData": text,
+            }
+        )
+    return records
+
+
+def create_report(report_path, report_date, records):
+    """Полностью пересобирает Word-файл и сортирует его по признаку и дате."""
+    document = Document()
+    section = document.sections[0]
+    section.orientation = WD_ORIENT.LANDSCAPE
+    section.page_width = Cm(29.7)
+    section.page_height = Cm(21.0)
+    section.top_margin = Cm(1.3)
+    section.bottom_margin = Cm(1.3)
+    section.left_margin = Cm(1.3)
+    section.right_margin = Cm(1.3)
+
+    normal = document.styles["Normal"]
+    normal.font.name = "Arial"
+    normal.font.size = Pt(10)
+
+    title = document.add_paragraph()
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    title.paragraph_format.space_after = Pt(4)
+    title_run = title.add_run(f"SMS по признакам за {report_date.isoformat()}")
+    title_run.bold = True
+    title_run.font.name = "Arial"
+    title_run.font.size = Pt(16)
+
+    subtitle = document.add_paragraph()
+    subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    subtitle.paragraph_format.space_after = Pt(8)
+    subtitle_run = subtitle.add_run(f"Уникальных сообщений: {len(records)}")
+    subtitle_run.font.name = "Arial"
+    subtitle_run.font.size = Pt(10)
+
+    table = document.add_table(rows=1, cols=5)
+    table.style = "Table Grid"
+    table.autofit = False
+    headers = ["Признак", "Отправитель", "Получатель", "Дата", "Текст SMS"]
+    widths = [Cm(3.4), Cm(4.0), Cm(4.0), Cm(4.2), Cm(10.5)]
+
+    header_row = table.rows[0]
+    set_repeat_table_header(header_row)
+    for cell, header, width in zip(header_row.cells, headers, widths):
+        cell.width = width
+        set_cell_text(cell, header, bold=True, size=9)
+        shade_cell(cell, "D9EAF7")
+
+    sorted_records = sorted(
+        records,
+        key=lambda item: (item["keyword"].casefold(), item["DateTime"], item["hash"]),
+    )
+    for row_number, record in enumerate(sorted_records, start=1):
+        cells = table.add_row().cells
+        values = [
+            record["keyword"],
+            record["PhoneFrom"],
+            record["PhoneTo"],
+            record["DateTime"],
+            record["TpData"],
+        ]
+        for cell, value, width in zip(cells, values, widths):
+            cell.width = width
+            set_cell_text(cell, value, size=9)
+            if row_number % 2 == 0:
+                shade_cell(cell, "F4F8FB")
+
+    temporary = report_path.with_name("." + report_path.name + ".tmp.docx")
+    document.save(temporary)
+    temporary.replace(report_path)
+
+
+def update_reports(records):
+    """Объединяет новые SMS с уже записанными и обновляет Word-файлы."""
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    by_date = {}
+    for record in records:
+        by_date.setdefault(record["report_date"], []).append(record)
+
+    hashes_written_to_reports = set()
+    for report_date, new_records in sorted(by_date.items()):
+        report_path = REPORTS_DIR / f"{report_date.isoformat()}.docx"
+        combined = {
+            record["hash"]: record
+            for record in read_existing_records(report_path)
+        }
+        for record in new_records:
+            combined.setdefault(record["hash"], record)
+        create_report(report_path, report_date, list(combined.values()))
+        hashes_written_to_reports.update(record["hash"] for record in new_records)
+        logging.info("Обновлён отчёт %s", report_path)
+    return hashes_written_to_reports
+
+
+def run_one_cycle(client):
+    """Один полный цикл: запрос, поиск, Word, хэши, курсор."""
+    keywords = load_keywords()
+    saved_hashes = load_hashes()
+    start = load_cursor()
+    end = datetime.now().replace(microsecond=0)
+
+    if end <= FIRST_START:
+        logging.info("Время FIRST_START ещё не наступило")
+        return
+
+    logging.info("Запрос ClickHouse: %s <= DateTime < %s", start, end)
+    rows = read_messages(client, start, end, keywords)
+    logging.info("Получено после предварительного фильтра: %s", len(rows))
+
+    accepted = []
+    batch_hashes = set()
+    for row in rows:
+        record = normalize_message(row, keywords)
+        if record is None:
+            continue
+        value = record["hash"]
+        if value in saved_hashes or value in batch_hashes:
+            continue
+        batch_hashes.add(value)
+        accepted.append(record)
+
+    written_hashes = update_reports(accepted)
+    append_hashes(written_hashes)
+    save_cursor(end)
+    logging.info("Новых уникальных SMS: %s", len(accepted))
+
+
+def next_run_after(now):
+    """Находит ближайшее будущее время из RUN_TIMES."""
+    candidates = []
+    for day_offset in (0, 1):
+        candidate_date = now.date() + timedelta(days=day_offset)
+        for scheduled_time in RUN_TIMES:
+            candidate = datetime.combine(candidate_date, scheduled_time)
+            if candidate > now:
+                candidates.append(candidate)
+    return min(candidates)
+
+
+def main():
+    setup_logging()
+    logging.info("Запуск SMS Monitor")
+    client = get_client()
+    try:
+        # При запуске не ждём следующего часа, а сразу делаем запрос.
+        while True:
+            try:
+                run_one_cycle(client)
+                next_run = next_run_after(datetime.now())
+                delay = max(1, (next_run - datetime.now()).total_seconds())
+                logging.info("Следующий запуск: %s", next_run)
+                time.sleep(delay)
+            except KeyboardInterrupt:
+                raise
+            except Exception:
+                logging.exception("Ошибка цикла. Повтор через %s минут", RETRY_MINUTES)
+                time.sleep(RETRY_MINUTES * 60)
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                client = get_client()
+    except KeyboardInterrupt:
+        logging.info("Программа остановлена")
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
